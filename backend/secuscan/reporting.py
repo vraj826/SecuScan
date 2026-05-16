@@ -973,5 +973,100 @@ class ReportGenerator:
             )
         return output.getvalue()
 
+    @classmethod
+    def generate_sarif_report(cls, task: Dict[str, Any], result: Dict[str, Any]) -> str:
+        """Generate a SARIF v2.1.0 report for GitHub Code Scanning."""
+        payload = cls._build_report_payload(task, result)
+        tool_name = payload["tool_name"]
+
+        # Define severity mapping to SARIF levels
+        severity_map = {
+            "CRITICAL": "error",
+            "HIGH": "error",
+            "MEDIUM": "warning",
+            "LOW": "note",
+            "INFO": "note"
+        }
+
+        rules = []
+        rule_indices = {}
+        results = []
+
+        for finding in payload["findings"]:
+            rule_id = finding.get("category", "General").replace(" ", "-").lower()
+            if rule_id not in rule_indices:
+                rule_indices[rule_id] = len(rules)
+                rules.append({
+                    "id": rule_id,
+                    "name": finding.get("title", "Security Finding"),
+                    "shortDescription": {
+                        "text": finding.get("title", "Security Finding")
+                    },
+                    "fullDescription": {
+                        "text": finding.get("description", "No detailed description available.")
+                    },
+                    "help": {
+                        "text": finding.get("remediation", "No remediation provided.")
+                    },
+                    "properties": {
+                        "precision": "high"
+                    }
+                })
+
+            sarif_result = {
+                "ruleId": rule_id,
+                "ruleIndex": rule_indices[rule_id],
+                "message": {
+                    "text": finding.get("description", "Security finding detected")
+                },
+                "level": severity_map.get(finding["severity"], "note"),
+                "locations": []
+            }
+
+            # Attempt to extract location if available
+            target = finding.get("target") or payload["target"]
+            # Check if target looks like a file path or URI
+            if target:
+                location = {
+                    "physicalLocation": {
+                        "artifactLocation": {
+                            "uri": target
+                        }
+                    }
+                }
+
+                # If target has a line number like file.py:123
+                if ":" in target:
+                    parts = target.split(":")
+                    if parts[-1].isdigit():
+                        location["physicalLocation"]["artifactLocation"]["uri"] = ":".join(parts[:-1])
+                        location["physicalLocation"]["region"] = {
+                            "startLine": int(parts[-1])
+                        }
+
+                sarif_result["locations"].append(location)
+
+            results.append(sarif_result)
+
+        sarif_output = {
+            "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json",
+            "version": "2.1.0",
+            "runs": [
+                {
+                    "tool": {
+                        "driver": {
+                            "name": tool_name,
+                            "version": "1.0.0",
+                            "informationUri": "https://github.com/utksh1/SecuScan",
+                            "rules": rules
+                        }
+                    },
+                    "results": results
+                }
+            ]
+        }
+
+        return json.dumps(sarif_output, indent=2)
+
 
 reporting = ReportGenerator()

@@ -357,6 +357,31 @@ async def download_pdf_report(task_id: str):
     )
 
 
+@router.get("/task/{task_id}/report/sarif")
+async def download_sarif_report(task_id: str):
+    """Download task results as a SARIF report."""
+    db = await get_db()
+    task_row = await db.fetchone(
+        "SELECT id, plugin_id, tool_name, target, status, created_at, preset, inputs_json, command_used, structured_json FROM tasks WHERE id = ?",
+        (task_id,)
+    )
+
+    if not task_row:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task_row["status"] not in ["completed", "failed"]:
+        raise HTTPException(status_code=400, detail="Task is not finished yet")
+
+    structured_data = json.loads(task_row["structured_json"]) if task_row["structured_json"] else {}
+    sarif_data = reporting.generate_sarif_report(dict(task_row), {"structured": structured_data})
+
+    return Response(
+        content=sarif_data,
+        media_type="application/sarif+json",
+        headers={"Content-Disposition": f"attachment; filename={build_report_filename(dict(task_row), 'sarif')}"}
+    )
+
+
 @router.get("/task/{task_id}/result")
 async def get_task_result(task_id: str):
     """Get task execution result"""
