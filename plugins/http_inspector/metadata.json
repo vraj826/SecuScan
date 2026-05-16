@@ -92,5 +92,5 @@
     "system_packages": []
   },
   "docker_image": "curlimages/curl",
-  "checksum": "fa4ca833b6ee0106d47c450415fb103f1e0dde661d2e434ca4b2356a1acfc8d6"
+  "checksum": "f80e34ebdbf13c551c61890ce33563d9a5938d4024e59f33649828181ecbfb07"
 }
