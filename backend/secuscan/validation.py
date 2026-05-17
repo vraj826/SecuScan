@@ -4,7 +4,7 @@ Input validation and security checks
 
 import re
 import ipaddress
-from typing import Tuple
+from typing import Tuple, Dict, Any
 from fnmatch import fnmatch
 
 from .config import settings
@@ -12,9 +12,9 @@ from .config import settings
 
 # Blocked network ranges
 BLOCKED_NETWORKS = [
-    ipaddress.ip_network("0.0.0.0/8"),       # Broadcast
-    ipaddress.ip_network("169.254.0.0/16"),  # Link-local
-    ipaddress.ip_network("224.0.0.0/4"),     # Multicast
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("224.0.0.0/4"),
 ]
 
 # Allowed private IP ranges
@@ -29,63 +29,197 @@ ALLOWED_PRIVATE = [
 BLOCKED_TLDS = [".mil", ".gov"]
 
 
+def extract_target_from_inputs(inputs: Dict[str, Any]) -> str:
+    """
+    Best-effort target extraction across plugin shapes.
+    Centralized shared helper for routes/executor/plugins.
+
+    Args:
+        inputs: User-provided plugin inputs
+
+    Returns:
+        Extracted target string
+    """
+    return (
+        inputs.get("target")
+        or inputs.get("url")
+        or inputs.get("host")
+        or inputs.get("domain")
+        or ""
+    )
+
+
+def sanitize_input(value: str) -> str:
+    """
+    Sanitize user input to reduce command injection risk.
+
+    Args:
+        value: Input value to sanitize
+
+    Returns:
+        Sanitized value
+    """
+    dangerous_chars = [';', '|', '&', '$', '`', '(', ')', '<', '>', '\n', '\r']
+
+    for char in dangerous_chars:
+        value = value.replace(char, '')
+
+    return value.strip()
+
+
+def sanitize_inputs(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Recursively sanitize string-based user inputs.
+
+    Args:
+        inputs: Raw user inputs
+
+    Returns:
+        Sanitized input dictionary
+    """
+    sanitized: Dict[str, Any] = {}
+
+    for key, value in inputs.items():
+        if isinstance(value, str):
+            sanitized[key] = sanitize_input(value)
+
+        elif isinstance(value, list):
+            sanitized[key] = [
+                sanitize_input(v) if isinstance(v, str) else v
+                for v in value
+            ]
+
+        elif isinstance(value, dict):
+            sanitized[key] = sanitize_inputs(value)
+
+        else:
+            sanitized[key] = value
+
+    return sanitized
+
+
+def validate_task_inputs(
+    inputs: Dict[str, Any],
+    safe_mode: bool = True
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Centralized validation boundary for task inputs.
+
+    Responsibilities:
+    - sanitize inputs
+    - extract target consistently
+    - validate targets
+    - normalize payload structure
+
+    Args:
+        inputs: Raw task inputs
+        safe_mode: Whether safe mode restrictions apply
+
+    Returns:
+        Tuple:
+        (
+            is_valid,
+            error_message,
+            sanitized_inputs
+        )
+    """
+    sanitized_inputs = sanitize_inputs(inputs)
+
+    target = extract_target_from_inputs(sanitized_inputs)
+
+    if target:
+        is_valid, error_msg = validate_target(
+            str(target),
+            safe_mode=safe_mode
+        )
+
+        if not is_valid:
+            return False, error_msg, sanitized_inputs
+
+    return True, "", sanitized_inputs
+
+
 def validate_target(target: str, safe_mode: bool = True) -> Tuple[bool, str]:
     """
     Validate scan target address (IP, Hostname, URL, or CIDR).
-    
+
     Args:
         target: IP address, hostname, or network range to validate
         safe_mode: Whether to enforce safe mode restrictions
-    
+
     Returns:
         Tuple of (is_valid, error_message)
     """
     target = target.strip()
+
     if not target:
         return False, "Target cannot be empty"
 
-    # Try parsing as IP network (handles single IP and CIDR)
+    # Try parsing as IP network
     try:
         net = ipaddress.ip_network(target, strict=False)
-        
-        # Check blocked networks (Broadcast, Link-local, Multicast)
+
+        # Check blocked networks
         if any(net.overlaps(blocked) for blocked in BLOCKED_NETWORKS):
             return False, "Target overlaps with blocked network range"
 
-        # Check for loopback even in non-safe mode if desired (usually allowed for local debugging)
+        # Loopback restrictions
         if net.is_loopback and not settings.allow_loopback_scans:
             return False, "Loopback scans are disabled in global settings"
 
-        # Safe mode: only allow private IPs
+        # Safe mode restrictions
         if safe_mode:
             is_private = any(
-                (net.version == allowed.version and (net.subnet_of(allowed) or net.overlaps(allowed)))
+                (
+                    net.version == allowed.version
+                    and (
+                        net.subnet_of(allowed)
+                        or net.overlaps(allowed)
+                    )
+                )
                 for allowed in ALLOWED_PRIVATE
             )
+
             if not is_private:
-                return False, "Public IPs/networks not allowed in safe mode (SecuScan Guardrail)"
+                return False, (
+                    "Public IPs/networks not allowed "
+                    "in safe mode (SecuScan Guardrail)"
+                )
 
         return True, ""
 
     except ValueError:
-        # Not an IP address or network, treat as hostname/URL
         pass
 
     # Handle URLs
     hostname_to_validate = target
-    if target.startswith(("http://", "https://")):
-        # Extract host:port or host
-        hostname_to_validate = target.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0]
 
-    # Validate hostname format (RFC 1123)
-    if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$', hostname_to_validate):
+    if target.startswith(("http://", "https://")):
+        hostname_to_validate = (
+            target.split("://", 1)[1]
+            .split("/", 1)[0]
+            .split(":", 1)[0]
+        )
+
+    # Hostname validation
+    hostname_pattern = (
+        r'^[a-zA-Z0-9]'
+        r'([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?'
+        r'(\.[a-zA-Z0-9]'
+        r'([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$'
+    )
+
+    if not re.match(hostname_pattern, hostname_to_validate):
         return False, "Invalid hostname format"
 
-    # Check blocked TLDs in safe mode
+    # Block restricted TLDs
     if safe_mode:
         for tld in BLOCKED_TLDS:
             if hostname_to_validate.lower().endswith(tld):
-                return False, f"Domains ending in {tld} are blocked in safe mode"
+                return False, (
+                    f"Domains ending in {tld} "
+                    "are blocked in safe mode"
+                )
 
     return True, ""
 
@@ -93,54 +227,52 @@ def validate_target(target: str, safe_mode: bool = True) -> Tuple[bool, str]:
 def validate_port(port: int) -> Tuple[bool, str]:
     """
     Validate port number.
-    
-    Args:
-        port: Port number to validate
-    
-    Returns:
-        Tuple of (is_valid, error_message)
     """
     if port < 1 or port > 65535:
         return False, "Port must be between 1 and 65535"
-    
+
     return True, ""
 
 
 def validate_port_range(port_range: str) -> Tuple[bool, str]:
     """
     Validate port range specification.
-    
-    Args:
-        port_range: Port range string (e.g., "80,443" or "1-1000")
-    
-    Returns:
-        Tuple of (is_valid, error_message)
     """
-    # Handle comma-separated ports
+    # Comma-separated ports
     if ',' in port_range:
         for port_str in port_range.split(','):
             try:
                 port = int(port_str.strip())
+
                 is_valid, msg = validate_port(port)
+
                 if not is_valid:
                     return False, msg
+
             except ValueError:
                 return False, f"Invalid port number: {port_str}"
+
         return True, ""
 
-    # Handle port ranges
+    # Port ranges
     if '-' in port_range:
         try:
             start, end = map(int, port_range.split('-'))
+
             if start > end:
-                return False, "Port range start must be less than end"
+                return False, (
+                    "Port range start must be less than end"
+                )
 
             is_valid, msg = validate_port(start)
+
             if not is_valid:
                 return False, msg
 
             is_valid, msg = validate_port(end)
+
             return (True, "") if is_valid else (False, msg)
+
         except ValueError:
             return False, "Invalid port range format"
 
@@ -148,6 +280,7 @@ def validate_port_range(port_range: str) -> Tuple[bool, str]:
     try:
         port = int(port_range)
         return validate_port(port)
+
     except ValueError:
         return False, "Invalid port specification"
 
@@ -155,60 +288,40 @@ def validate_port_range(port_range: str) -> Tuple[bool, str]:
 def validate_url(url: str) -> Tuple[bool, str]:
     """
     Validate URL format.
-    
-    Args:
-        url: URL to validate
-    
-    Returns:
-        Tuple of (is_valid, error_message)
     """
-    # Basic URL validation
     url_pattern = re.compile(
-        r'^https?://'  # http:// or https://
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'  # domain
-        r'localhost|'  # localhost
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # IP
-        r'(?::\d+)?'  # optional port
-        r'(?:/?|[/?]\S+)$', re.IGNORECASE
+        r'^https?://'
+        r'(?:(?:[A-Z0-9]'
+        r'(?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+'
+        r'[A-Z]{2,6}\.?|'
+        r'localhost|'
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
+        r'(?::\d+)?'
+        r'(?:/?|[/?]\S+)$',
+        re.IGNORECASE
     )
 
-    return (True, "") if url_pattern.match(url) else (False, "Invalid URL format")
-
-
-def sanitize_input(value: str) -> str:
-    """
-    Sanitize user input to prevent command injection.
-    
-    Args:
-        value: Input value to sanitize
-    
-    Returns:
-        Sanitized value
-    """
-    # Remove shell metacharacters
-    dangerous_chars = [';', '|', '&', '$', '`', '(', ')', '<', '>', '\n', '\r']
-    for char in dangerous_chars:
-        value = value.replace(char, '')
-    
-    return value.strip()
+    return (
+        (True, "")
+        if url_pattern.match(url)
+        else (False, "Invalid URL format")
+    )
 
 
 def is_safe_path(path: str, base_dir: str) -> bool:
     """
     Check if a path is safe (no directory traversal).
-    
-    Args:
-        path: Path to check
-        base_dir: Base directory to restrict to
-    
-    Returns:
-        True if path is safe
     """
     import os
+
     try:
         real_base = os.path.realpath(base_dir)
-        real_path = os.path.realpath(os.path.join(base_dir, path))
+        real_path = os.path.realpath(
+            os.path.join(base_dir, path)
+        )
+
         return real_path.startswith(real_base)
+
     except Exception:
         return False
 
@@ -216,12 +329,5 @@ def is_safe_path(path: str, base_dir: str) -> bool:
 def match_pattern(value: str, pattern: str) -> bool:
     """
     Match value against wildcard pattern.
-    
-    Args:
-        value: Value to match
-        pattern: Pattern with wildcards (* and ?)
-    
-    Returns:
-        True if value matches pattern
     """
     return fnmatch(value, pattern)

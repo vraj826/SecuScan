@@ -18,6 +18,10 @@ from .config import settings
 from .database import get_db
 from .plugins import get_plugin_manager
 from .models import TaskStatus
+from .validation import (
+    extract_target_from_inputs,
+    sanitize_inputs,
+)
 
 # Modular Scanners
 from .scanners.port_scanner import PortScanner
@@ -32,16 +36,6 @@ MODULAR_SCANNERS = {
 
 logger = logging.getLogger(__name__)
 
-
-def extract_target(inputs: Dict[str, Any]) -> str:
-    """Best-effort target extraction across plugin shapes."""
-    return (
-        inputs.get("target")
-        or inputs.get("url")
-        or inputs.get("host")
-        or inputs.get("domain")
-        or ""
-    )
 class TaskExecutor:
     """Executes security scanning tasks in isolated environments"""
 
@@ -104,6 +98,8 @@ class TaskExecutor:
             # Merge preset with user inputs (user inputs take precedence)
             inputs = {**preset_values, **inputs}
         
+        inputs = sanitize_inputs(inputs)
+        
         # Store task in database
         db = await get_db()
         await db.execute(
@@ -117,7 +113,7 @@ class TaskExecutor:
                 task_id,
                 plugin_id,
                 plugin.name,
-                extract_target(inputs),
+                extract_target_from_inputs(inputs),
                 json.dumps(inputs),
                 preset,
                 TaskStatus.QUEUED.value,
@@ -166,7 +162,7 @@ class TaskExecutor:
             plugin_id = task_row["plugin_id"]
             inputs = json.loads(task_row["inputs_json"])
             safe_mode = bool(task_row["safe_mode"])
-            target = extract_target(inputs)
+            target = extract_target_from_inputs(inputs)
 
             # Check if this is a modular scanner or a standard plugin
             if plugin_id in MODULAR_SCANNERS:
