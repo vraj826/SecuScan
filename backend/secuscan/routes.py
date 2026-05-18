@@ -241,7 +241,7 @@ async def start_task(
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    
+
 @router.get("/task/{task_id}/status")
 async def get_task_status(task_id: str):
     """Get task status"""
